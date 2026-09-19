@@ -1,0 +1,29 @@
+# secrets / credentials — NEVER commit
+*.pem
+id_*
+.ssh-personal/
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+*credential*
+*secret*
+kubeconfig
+.kube/
+.aws/
+terraform.tfvars
+*.auto.tfvars
+
+# terraform state — contains secrets in plaintext
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+
+# misc
+.DS_Store
+*.log
+node_modules/
+__pycache__/
+venv/
