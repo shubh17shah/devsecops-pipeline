@@ -1,0 +1,97 @@
+name: vulnerable-demo
+
+# Deliberately-failing counterpart to ci.yml's `scan` job.
+#
+# Builds app/Dockerfile.vulnerable — the same application as app/Dockerfile,
+# but with its final stage swapped to an End-of-Life ubuntu:16.04 base image
+# and no non-root USER — and runs the identical Trivy gate the real
+# pipeline uses. The gate is EXPECTED TO FAIL here. That failure is the
+# point: it's the reproducible proof that the security gate in ci.yml
+# actually blocks a bad image instead of just reporting on it.
+# See docs/PROOF.md for what this demonstrates and how to read the run.
+#
+# Isolated on its own branch/trigger so it can never block `main`, never
+# pushes an image anywhere, and never runs any step past the scan.
+
+on:
+  push:
+    branches: [demo/vulnerable]
+  workflow_dispatch: {}
+
+concurrency:
+  group: vulnerable-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-scan-vulnerable:
+    name: build-and-scan-vulnerable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # to upload the SARIF report before the gate fails the job
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build vulnerable image (loaded into the local daemon, not pushed)
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: app
+          file: app/Dockerfile.vulnerable
+          push: false
+          load: true
+          tags: devsecops-pipeline/app:vulnerable-${{ env.IMAGE_TAG }}
+          build-args: |
+            VERSION=${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Full, non-blocking report first so the Security tab is populated
+      # even though (especially because) the gate below is about to fail
+      # the job on these same findings. Mirrors ci.yml's `scan` job.
+      - name: Trivy full report (non-blocking, SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: devsecops-pipeline/app:vulnerable-${{ env.IMAGE_TAG }}
+          scan-type: image
+          format: sarif
+          output: trivy-vulnerable-report.sarif
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4.38.1
+        with:
+          sarif_file: trivy-vulnerable-report.sarif
+          category: trivy-image-vulnerable-demo
+
+      # The actual gate — identical thresholds to ci.yml's `scan` job.
+      # ubuntu:16.04 has years of unpatched HIGH/CRITICAL OS package CVEs,
+      # so this step is expected to exit non-zero and fail this job. If it
+      # ever starts passing, something is wrong with the demo, not proof
+      # that the base image got safer.
+      - name: Trivy vulnerability gate (blocking) — expected to FAIL
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: devsecops-pipeline/app:vulnerable-${{ env.IMAGE_TAG }}
+          scan-type: image
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### This job is SUPPOSED to fail" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`app/Dockerfile.vulnerable\` pins \`ubuntu:16.04\` (End-of-Standard-Support since April 2021) and runs as root, on purpose. The Trivy gate above blocks on its HIGH/CRITICAL CVEs — the same gate and the same thresholds \`ci.yml\`'s \`scan\` job enforces against the real \`app/Dockerfile\`. A red ✗ here is the demo working as intended. See [docs/PROOF.md](../../docs/PROOF.md)." >> "$GITHUB_STEP_SUMMARY"

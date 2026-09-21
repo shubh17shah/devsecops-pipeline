@@ -27,3 +27,10 @@ crash.log
 node_modules/
 __pycache__/
 venv/
+
+# local tool downloads / build cache
+.tmp-toolchain/
+gocache/
+*.tar.gz
+app-bin
+app-run

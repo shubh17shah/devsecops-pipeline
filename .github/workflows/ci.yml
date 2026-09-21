@@ -1,0 +1,548 @@
+name: ci
+
+# Pipeline: unit tests -> SAST -> multi-stage Docker build -> Trivy scan
+# (blocking) -> SBOM + Cosign keyless signing -> push to ECR -> ArgoCD
+# staging deploy + smoke tests -> manual prod approval -> automatic
+# rollback on failure. Each stage is a job wired with `needs:` so the DAG
+# below is enforced by GitHub Actions itself, not just documentation.
+#
+# Required repository configuration (see README.md "Setup prerequisites"
+# and docs/VAULT.md) — none of this works out of the box, all of it is
+# placeholder-shaped on purpose:
+#   Variables (Settings > Secrets and variables > Actions > Variables):
+#     AWS_REGION, AWS_ROLE_ARN, ECR_REGISTRY, ECR_REPOSITORY,
+#     SONAR_ORGANIZATION, SONAR_PROJECT_KEY, GITOPS_REPO,
+#     ARGOCD_SERVER, ARGOCD_STAGING_APP, ARGOCD_PROD_APP,
+#     STAGING_URL, PROD_URL
+#   Secrets:
+#     SONAR_TOKEN, GITOPS_REPO_TOKEN, ARGOCD_AUTH_TOKEN
+# AWS credentials are never long-lived keys: AWS_ROLE_ARN is assumed via
+# GitHub's OIDC token (permissions.id-token: write), see the `sign` and
+# `push` jobs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default: every job below opts back in to only the
+# scopes it actually needs.
+permissions: {}
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+  GO_VERSION_FILE: app/go.mod
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Unit tests
+  # ---------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          check-latest: true
+          # No go.sum: the app has zero external dependencies today, so
+          # there is nothing for setup-go's module cache to key off of.
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (with coverage)
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: coverage-report
+          path: app/coverage.out
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # 2. SAST: SonarCloud, with a Semgrep fallback that needs no secrets
+  # ---------------------------------------------------------------------
+  sast:
+    name: sast
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # to upload Semgrep's SARIF to the Security tab
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0 # SonarCloud wants full history for blame/new-code
+
+      - name: SonarCloud scan
+        id: sonarcloud
+        uses: SonarSource/sonarqube-scan-action@v8.2.2
+        # SONAR_TOKEN isn't available on PRs from forks, and this is a
+        # portfolio repo without a live SonarCloud org wired up yet — don't
+        # let a missing/invalid token take the whole pipeline down.
+        # Semgrep below is the always-on safety net for exactly that case.
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+
+      - name: Semgrep SAST (fallback / defense-in-depth)
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check semgrep
+          semgrep scan \
+            --config auto \
+            --config p/golang \
+            --sarif --output semgrep-results.sarif \
+            --error \
+            app/
+
+      - name: Upload Semgrep SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4.38.1
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+
+      - name: Fail if both SAST tools were unavailable
+        if: steps.sonarcloud.outcome == 'failure'
+        run: |
+          echo "::warning::SonarCloud step failed or SONAR_TOKEN is not configured. Relying on Semgrep results for this run — see docs/PROOF.md style notes in README for how to wire up SonarCloud."
+
+  # ---------------------------------------------------------------------
+  # 3. Multi-stage Docker build (no registry push yet)
+  # ---------------------------------------------------------------------
+  build:
+    name: build
+    needs: sast
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build image (loaded into the local daemon, not pushed)
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: app
+          file: app/Dockerfile
+          push: false
+          load: true
+          tags: devsecops-pipeline/app:${{ env.IMAGE_TAG }}
+          build-args: |
+            VERSION=${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save image as an OCI tarball
+        run: |
+          mkdir -p dist
+          docker save devsecops-pipeline/app:${{ env.IMAGE_TAG }} | gzip > dist/image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: docker-image
+          path: dist/image.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------------
+  # 4. Trivy scan — blocks the pipeline on HIGH/CRITICAL
+  # ---------------------------------------------------------------------
+  scan:
+    name: scan
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # to upload the full SARIF report
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: docker-image
+          path: dist
+
+      - name: Load image into Docker daemon
+        run: docker load < dist/image.tar.gz
+
+      # Full, non-blocking report first so the Security tab always gets
+      # populated, even if (especially if!) the run is about to fail the
+      # gate below on the same findings.
+      - name: Trivy full report (non-blocking, SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: devsecops-pipeline/app:${{ env.IMAGE_TAG }}
+          scan-type: image
+          format: sarif
+          output: trivy-full-report.sarif
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4.38.1
+        with:
+          sarif_file: trivy-full-report.sarif
+          category: trivy-image
+
+      # The actual gate. HIGH/CRITICAL with a known fix fails the build.
+      # ignore-unfixed is deliberate: failing on a CVE with no available
+      # patch just trains everyone to click "re-run" — see docs/PROOF.md
+      # for the branch that demonstrates this gate actually stopping a
+      # bad image.
+      - name: Trivy vulnerability gate (blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: devsecops-pipeline/app:${{ env.IMAGE_TAG }}
+          scan-type: image
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ---------------------------------------------------------------------
+  # 5. SBOM + keyless signing
+  #
+  # NOTE on ordering: a Cosign keyless signature is an OCI artifact stored
+  # *in the registry* next to the image it covers, so the image has to
+  # exist in ECR before Cosign can sign it. This job performs that push —
+  # it is the same "push to ECR" the pipeline description and job DAG
+  # refer to, not a separate copy. The downstream `push` job re-assumes a
+  # narrower-scoped role independently and is what actually decides the
+  # image is releasable: it verifies the signature/attestation Cosign just
+  # produced and promotes the moving tag that deploy-staging reads.
+  # ---------------------------------------------------------------------
+  sign:
+    name: sign
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # OIDC token for both AWS role assumption and Sigstore Fulcio
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: docker-image
+          path: dist
+
+      - name: Load image into Docker daemon
+        run: docker load < dist/image.tar.gz
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-devsecops-pipeline-sign
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.1.7
+
+      - name: Tag and push immutable image
+        id: push-image
+        run: |
+          set -euo pipefail
+          SRC="devsecops-pipeline/app:${IMAGE_TAG}"
+          DEST="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          docker tag "$SRC" "$DEST"
+          docker push "$DEST"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$DEST")
+          echo "image=$DEST" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0.24.2
+        with:
+          image: ${{ steps.push-image.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom-${{ env.IMAGE_TAG }}.spdx.json
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Cosign keyless sign
+        run: cosign sign --yes "${{ steps.push-image.outputs.digest }}"
+
+      - name: Attach SBOM as a signed attestation
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${{ steps.push-image.outputs.digest }}"
+    outputs:
+      image_digest: ${{ steps.push-image.outputs.digest }}
+
+  # ---------------------------------------------------------------------
+  # 6. Push / promote: verify the signature, move the release pointer
+  # ---------------------------------------------------------------------
+  push:
+    name: push
+    needs: sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-devsecops-pipeline-push
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.1.7
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Verify signature was produced by this workflow
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${{ needs.sign.outputs.image_digest }}"
+
+      - name: Promote moving tag (stable)
+        run: |
+          set -euo pipefail
+          docker pull "${{ needs.sign.outputs.image_digest }}"
+          STABLE="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:stable"
+          docker tag "${{ needs.sign.outputs.image_digest }}" "$STABLE"
+          docker push "$STABLE"
+    outputs:
+      image: ${{ needs.sign.outputs.image_digest }}
+
+  # ---------------------------------------------------------------------
+  # 7. Deploy to staging via ArgoCD, then smoke test
+  # ---------------------------------------------------------------------
+  deploy-staging:
+    name: deploy-staging
+    needs: push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (for smoke-tests/)
+        uses: actions/checkout@v7.0.1
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ vars.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_REPO_TOKEN }}
+          path: gitops
+
+      - name: Update staging image tag
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          FILE="environments/staging/kustomization.yaml"
+          yq -i '.images[0].newTag = strenv(IMAGE_TAG)' "$FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "deploy(staging): devsecops-pipeline app@${IMAGE_TAG}"
+          git push
+
+      - name: Install argocd CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Sync and wait for ArgoCD health
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          argocd app sync "${{ vars.ARGOCD_STAGING_APP }}" \
+            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
+          argocd app wait "${{ vars.ARGOCD_STAGING_APP }}" \
+            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
+            --health --timeout 300
+
+      - name: Smoke test staging
+        env:
+          SMOKE_TEST_URL: ${{ vars.STAGING_URL }}
+          EXPECTED_VERSION: ${{ env.IMAGE_TAG }}
+        run: ./smoke-tests/smoke-test.sh
+
+  # ---------------------------------------------------------------------
+  # 8. Deploy to production — gated behind manual approval
+  # ---------------------------------------------------------------------
+  deploy-prod:
+    name: deploy-prod
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production # required reviewers configured in repo settings
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (for smoke-tests/)
+        uses: actions/checkout@v7.0.1
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ vars.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_REPO_TOKEN }}
+          path: gitops
+
+      - name: Record current production tag (for rollback)
+        id: previous
+        working-directory: gitops
+        run: |
+          CURRENT=$(yq '.images[0].newTag' environments/production/kustomization.yaml)
+          echo "tag=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "$CURRENT" > previous-tag.txt
+
+      - name: Upload previous tag artifact
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: previous-prod-tag
+          path: gitops/previous-tag.txt
+          retention-days: 5
+
+      - name: Update production image tag
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          FILE="environments/production/kustomization.yaml"
+          yq -i '.images[0].newTag = strenv(IMAGE_TAG)' "$FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "deploy(production): devsecops-pipeline app@${IMAGE_TAG}"
+          git push
+
+      - name: Install argocd CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Sync and wait for ArgoCD health
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          argocd app sync "${{ vars.ARGOCD_PROD_APP }}" \
+            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
+          argocd app wait "${{ vars.ARGOCD_PROD_APP }}" \
+            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
+            --health --timeout 300
+
+      - name: Post-deploy health check
+        env:
+          SMOKE_TEST_URL: ${{ vars.PROD_URL }}
+          EXPECTED_VERSION: ${{ env.IMAGE_TAG }}
+        run: ./smoke-tests/smoke-test.sh
+
+  # ---------------------------------------------------------------------
+  # 9. Automatic rollback if the production release fails its health gate
+  # ---------------------------------------------------------------------
+  rollback:
+    name: rollback
+    needs: deploy-prod
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ vars.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_REPO_TOKEN }}
+          path: gitops
+
+      - name: Download previous tag artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: previous-prod-tag
+          path: previous
+
+      - name: Revert production image tag
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          PREVIOUS_TAG=$(cat ../previous/previous-tag.txt)
+          FILE="environments/production/kustomization.yaml"
+          yq -i ".images[0].newTag = \"${PREVIOUS_TAG}\"" "$FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "rollback(production): revert to ${PREVIOUS_TAG} after failed health check on ${IMAGE_TAG}"
+          git push
+
+      - name: Install argocd CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Sync and wait for ArgoCD health
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          argocd app sync "${{ vars.ARGOCD_PROD_APP }}" \
+            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
+          argocd app wait "${{ vars.ARGOCD_PROD_APP }}" \
+            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
+            --health --timeout 300
+
+      - name: Confirm rollback is healthy
+        env:
+          SMOKE_TEST_URL: ${{ vars.PROD_URL }}
+        run: ./smoke-tests/smoke-test.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### :leftwards_arrow_with_hook: Production rollback triggered" >> "$GITHUB_STEP_SUMMARY"
+          echo "Failed release: \`${IMAGE_TAG}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+#
+# INTENTIONALLY VULNERABLE — do not use this image anywhere real.
+#
+# This is a deliberate regression of app/Dockerfile: same builder stage,
+# same application, but the final stage sits on an End-of-Life base image
+# with years of unpatched OS package CVEs, and drops the non-root USER.
+# It exists purely to prove that the Trivy gate in .github/workflows/ci.yml
+# actually blocks a build — see docs/PROOF.md and
+# .github/workflows/vulnerable-demo.yml.
+
+# ---- build stage (unchanged from app/Dockerfile) ---------------------------
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /src
+
+COPY go.mod ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=dev
+ENV CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/app .
+
+# ---- final stage: deliberately ancient, deliberately root ------------------
+# ubuntu:16.04 ("Xenial") went End-of-Standard-Support in April 2021.
+# Nobody has shipped a security patch for its package set since. Trivy's
+# vulnerability DB has years of accumulated HIGH/CRITICAL CVEs for it.
+FROM ubuntu:16.04 AS final
+
+COPY --from=builder /out/app /app
+
+# No USER instruction: runs as root, on purpose, to make this as bad an
+# example as the demo needs it to be.
+
+EXPOSE 8080
+ENTRYPOINT ["/app"]
