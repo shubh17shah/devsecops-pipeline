@@ -1,0 +1,105 @@
+name: verify-security-gates
+
+# Operational control verification: this workflow builds a deliberately
+# vulnerable image and runs it through the identical Trivy gate ci.yml's
+# `scan` job enforces against the real app/Dockerfile. The gate is
+# EXPECTED TO FAIL every run. A red X here is the control working; a green
+# check here means the gate has silently stopped blocking and needs
+# investigation before it's trusted again.
+#
+# This is what "prove the gate still works" looks like as an operational
+# control instead of a one-time claim: it runs on a schedule (so a change
+# to Trivy's flags, the base image, or the action version that quietly
+# defangs the gate gets caught within a week, not whenever someone
+# happens to look), and it can be run on demand via workflow_dispatch for
+# an on-request audit check (e.g. before a compliance review).
+#
+# See docs/SECURITY-GATES.md for what this verifies, how to read a run,
+# and where the evidence from past runs lives.
+#
+# Isolated on its own trigger so it can never block `main`: it never
+# pushes an image anywhere, and never runs any step past the scan.
+
+on:
+  schedule:
+    # Every Monday 06:00 UTC. Cron, not a fixed calendar date, so this
+    # keeps running without anyone having to remember to re-trigger it.
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+concurrency:
+  group: verify-security-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  verify-trivy-gate:
+    name: verify-trivy-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # to upload the SARIF report before the gate fails the job
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build vulnerable image (loaded into the local daemon, not pushed)
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: app
+          file: app/Dockerfile.vulnerable
+          push: false
+          load: true
+          tags: telemetry-service:vulnerable-${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Full, non-blocking report first so the Security tab is populated
+      # even though (especially because) the gate below is about to fail
+      # the job on these same findings. Mirrors ci.yml's `scan` job.
+      - name: Trivy full report (non-blocking, SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: telemetry-service:vulnerable-${{ env.IMAGE_TAG }}
+          scan-type: image
+          format: sarif
+          output: trivy-vulnerable-report.sarif
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4.38.1
+        with:
+          sarif_file: trivy-vulnerable-report.sarif
+          category: trivy-image-verify-security-gates
+
+      # The actual gate — identical thresholds to ci.yml's `scan` job.
+      # node:16-alpine has been EOL since September 2023, so Trivy's
+      # database always has unpatched HIGH/CRITICAL CVEs against it. This
+      # step is expected to exit non-zero and fail this job. If it ever
+      # starts passing, the control has stopped working — that is a
+      # finding to investigate, not evidence the base image got safer.
+      - name: Trivy vulnerability gate (blocking) — expected to FAIL
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: telemetry-service:vulnerable-${{ env.IMAGE_TAG }}
+          scan-type: image
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### This job is SUPPOSED to fail" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`app/Dockerfile.vulnerable\` pins \`node:16-alpine\` (End-of-Life since September 2023), on purpose. The Trivy gate above blocks on its HIGH/CRITICAL CVEs — the same gate and the same thresholds \`ci.yml\`'s \`scan\` job enforces against the real \`app/Dockerfile\`. A red X here is the control working as intended; a green check would mean the gate has stopped blocking and needs investigation. See [docs/SECURITY-GATES.md](../../docs/SECURITY-GATES.md)." >> "$GITHUB_STEP_SUMMARY"

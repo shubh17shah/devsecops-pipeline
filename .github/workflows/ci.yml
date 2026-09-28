@@ -1,24 +1,32 @@
 name: ci
 
 # Pipeline: unit tests -> SAST -> multi-stage Docker build -> Trivy scan
-# (blocking) -> SBOM + Cosign keyless signing -> push to ECR -> ArgoCD
-# staging deploy + smoke tests -> manual prod approval -> automatic
-# rollback on failure. Each stage is a job wired with `needs:` so the DAG
-# below is enforced by GitHub Actions itself, not just documentation.
+# (blocking) -> SBOM + Cosign keyless signing -> push to GHCR -> GitOps
+# image-tag bump + ArgoCD-driven staging rollout + smoke tests -> manual
+# prod approval -> automatic rollback on failure. Each stage is a job wired
+# with `needs:` so the DAG below is enforced by GitHub Actions itself, not
+# just documentation.
 #
-# Required repository configuration (see README.md "Setup prerequisites"
-# and docs/VAULT.md) — none of this works out of the box, all of it is
-# placeholder-shaped on purpose:
+# app/ is telemetry-service, the Node.js/Express service also vendored
+# into shubh17shah/eks-platform (apps/telemetry-service) where it backs
+# all 12 of that platform's microservice Applications off one shared
+# image. This repo is that image's build/test/scan/sign/push pipeline;
+# eks-platform is the GitOps repo the `deploy-*` jobs below push the
+# resulting image tag into. See README.md for the full loop diagram.
+#
+# Required repository configuration (see README.md "Configuration" and
+# docs/VAULT.md) — documented there as required values, same as any other
+# CI pipeline's setup requirements:
 #   Variables (Settings > Secrets and variables > Actions > Variables):
-#     AWS_REGION, AWS_ROLE_ARN, ECR_REGISTRY, ECR_REPOSITORY,
-#     SONAR_ORGANIZATION, SONAR_PROJECT_KEY, GITOPS_REPO,
-#     ARGOCD_SERVER, ARGOCD_STAGING_APP, ARGOCD_PROD_APP,
-#     STAGING_URL, PROD_URL
+#     SONAR_ORGANIZATION, SONAR_PROJECT_KEY, GITOPS_REPO, ARGOCD_SERVER,
+#     ARGOCD_APPS, STAGING_URL, PROD_URL
 #   Secrets:
 #     SONAR_TOKEN, GITOPS_REPO_TOKEN, ARGOCD_AUTH_TOKEN
-# AWS credentials are never long-lived keys: AWS_ROLE_ARN is assumed via
-# GitHub's OIDC token (permissions.id-token: write), see the `sign` and
-# `push` jobs.
+# GHCR push and Cosign's Sigstore Fulcio step both authenticate via
+# GitHub's own OIDC token (permissions.id-token: write / packages: write)
+# — no registry credentials to provision for the default path. See the
+# `sign` job for the commented AWS OIDC/ECR alternative for when this
+# pipeline targets a live EKS cluster instead of (or in addition to) GHCR.
 
 on:
   push:
@@ -37,7 +45,11 @@ permissions: {}
 
 env:
   IMAGE_TAG: ${{ github.sha }}
-  GO_VERSION_FILE: app/go.mod
+  NODE_VERSION_FILE: app/package.json
+  # ghcr.io/shubh17shah/telemetry-service — matches the `image.repository`
+  # eks-platform's charts/microservice/values.yaml already pulls, so a tag
+  # pushed here is immediately deployable there with no chart change.
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/telemetry-service
 
 jobs:
   # ---------------------------------------------------------------------
@@ -56,29 +68,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
 
-      - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v5.0.0
         with:
-          go-version-file: ${{ env.GO_VERSION_FILE }}
-          check-latest: true
-          # No go.sum: the app has zero external dependencies today, so
-          # there is nothing for setup-go's module cache to key off of.
+          node-version-file: ${{ env.NODE_VERSION_FILE }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
 
-      - name: go vet
-        run: go vet ./...
+      - name: Install dependencies
+        # No package-lock.json is committed yet (see app/README.md "Local
+        # development"), so `npm ci` has nothing to install *against*.
+        # `npm install` resolves and installs in one step here; once the
+        # lockfile is committed, swap this for `npm ci` so CI installs
+        # exactly what's locked instead of re-resolving every run.
+        run: npm install
 
-      - name: go test (with coverage)
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Lint
+        run: npm run lint
 
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: coverage-report
-          path: app/coverage.out
-          retention-days: 14
+      - name: Unit tests
+        run: node --test test/
 
   # ---------------------------------------------------------------------
   # 2. SAST: SonarCloud, with a Semgrep fallback that needs no secrets
@@ -100,10 +109,10 @@ jobs:
       - name: SonarCloud scan
         id: sonarcloud
         uses: SonarSource/sonarqube-scan-action@v8.2.2
-        # SONAR_TOKEN isn't available on PRs from forks, and this is a
-        # portfolio repo without a live SonarCloud org wired up yet — don't
-        # let a missing/invalid token take the whole pipeline down.
-        # Semgrep below is the always-on safety net for exactly that case.
+        # SONAR_TOKEN isn't available on PRs from forks, and a SonarCloud
+        # org may not be wired up for every fork of this repo — don't let
+        # a missing/invalid token take the whole pipeline down. Semgrep
+        # below is the always-on safety net for exactly that case.
         continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -120,7 +129,8 @@ jobs:
           python3 -m pip install --quiet --disable-pip-version-check semgrep
           semgrep scan \
             --config auto \
-            --config p/golang \
+            --config p/nodejsscan \
+            --config p/expressjs \
             --sarif --output semgrep-results.sarif \
             --error \
             app/
@@ -135,7 +145,7 @@ jobs:
       - name: Fail if both SAST tools were unavailable
         if: steps.sonarcloud.outcome == 'failure'
         run: |
-          echo "::warning::SonarCloud step failed or SONAR_TOKEN is not configured. Relying on Semgrep results for this run — see docs/PROOF.md style notes in README for how to wire up SonarCloud."
+          echo "::warning::SonarCloud step failed or SONAR_TOKEN is not configured. Relying on Semgrep results for this run — see README.md 'Configuration' for how to wire up SonarCloud."
 
   # ---------------------------------------------------------------------
   # 3. Multi-stage Docker build (no registry push yet)
@@ -161,16 +171,14 @@ jobs:
           file: app/Dockerfile
           push: false
           load: true
-          tags: devsecops-pipeline/app:${{ env.IMAGE_TAG }}
-          build-args: |
-            VERSION=${{ env.IMAGE_TAG }}
+          tags: telemetry-service:${{ env.IMAGE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Save image as an OCI tarball
         run: |
           mkdir -p dist
-          docker save devsecops-pipeline/app:${{ env.IMAGE_TAG }} | gzip > dist/image.tar.gz
+          docker save telemetry-service:${{ env.IMAGE_TAG }} | gzip > dist/image.tar.gz
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v7.0.1
@@ -209,7 +217,7 @@ jobs:
       - name: Trivy full report (non-blocking, SARIF)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: devsecops-pipeline/app:${{ env.IMAGE_TAG }}
+          image-ref: telemetry-service:${{ env.IMAGE_TAG }}
           scan-type: image
           format: sarif
           output: trivy-full-report.sarif
@@ -224,13 +232,13 @@ jobs:
 
       # The actual gate. HIGH/CRITICAL with a known fix fails the build.
       # ignore-unfixed is deliberate: failing on a CVE with no available
-      # patch just trains everyone to click "re-run" — see docs/PROOF.md
-      # for the branch that demonstrates this gate actually stopping a
-      # bad image.
+      # patch just trains everyone to click "re-run" — see
+      # docs/SECURITY-GATES.md for a scheduled run that verifies this gate
+      # actually stops a bad image, not just that the step exists.
       - name: Trivy vulnerability gate (blocking)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: devsecops-pipeline/app:${{ env.IMAGE_TAG }}
+          image-ref: telemetry-service:${{ env.IMAGE_TAG }}
           scan-type: image
           format: table
           severity: 'HIGH,CRITICAL'
@@ -242,12 +250,12 @@ jobs:
   #
   # NOTE on ordering: a Cosign keyless signature is an OCI artifact stored
   # *in the registry* next to the image it covers, so the image has to
-  # exist in ECR before Cosign can sign it. This job performs that push —
-  # it is the same "push to ECR" the pipeline description and job DAG
-  # refer to, not a separate copy. The downstream `push` job re-assumes a
-  # narrower-scoped role independently and is what actually decides the
-  # image is releasable: it verifies the signature/attestation Cosign just
-  # produced and promotes the moving tag that deploy-staging reads.
+  # exist in GHCR before Cosign can sign it. This job performs that push —
+  # it is the same "push to GHCR" the pipeline description and job DAG
+  # refer to, not a separate copy. The downstream `push` job re-authenticates
+  # independently and is what actually decides the image is releasable: it
+  # verifies the signature/attestation Cosign just produced and promotes
+  # the moving tag that deploy-staging reads.
   # ---------------------------------------------------------------------
   sign:
     name: sign
@@ -256,7 +264,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write # OIDC token for both AWS role assumption and Sigstore Fulcio
+      packages: write # push to GHCR
+      id-token: write # OIDC token for Sigstore Fulcio (keyless signing)
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
@@ -270,23 +279,43 @@ jobs:
       - name: Load image into Docker daemon
         run: docker load < dist/image.tar.gz
 
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+      - name: Log in to GHCR
+        uses: docker/login-action@v3.6.0
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: gha-devsecops-pipeline-sign
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Amazon ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2.1.7
+      # --- AWS OIDC / ECR alternative (commented) ---------------------
+      # Kept here, not deleted, for when this pipeline targets a live EKS
+      # cluster pulling from a private ECR repository instead of (or
+      # alongside) GHCR's public pulls. No long-lived AWS keys either way
+      # — the role is assumed via GitHub's OIDC token.
+      #
+      # - name: Configure AWS credentials via OIDC
+      #   uses: aws-actions/configure-aws-credentials@v6.3.0
+      #   with:
+      #     role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+      #     aws-region: ${{ vars.AWS_REGION }}
+      #     role-session-name: gha-devsecops-pipeline-sign
+      #
+      # - name: Login to Amazon ECR
+      #   id: ecr-login
+      #   uses: aws-actions/amazon-ecr-login@v2.1.7
+      #
+      # - name: Tag and push to ECR instead of/alongside GHCR
+      #   run: |
+      #     DEST="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${IMAGE_TAG}"
+      #     docker tag "telemetry-service:${IMAGE_TAG}" "$DEST"
+      #     docker push "$DEST"
+      # ------------------------------------------------------------------
 
       - name: Tag and push immutable image
         id: push-image
         run: |
           set -euo pipefail
-          SRC="devsecops-pipeline/app:${IMAGE_TAG}"
-          DEST="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          SRC="telemetry-service:${IMAGE_TAG}"
+          DEST="${IMAGE_NAME}:${IMAGE_TAG}"
           docker tag "$SRC" "$DEST"
           docker push "$DEST"
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$DEST")
@@ -326,18 +355,15 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      packages: write
       id-token: write
     steps:
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+      - name: Log in to GHCR
+        uses: docker/login-action@v3.6.0
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: gha-devsecops-pipeline-push
-
-      - name: Login to Amazon ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2.1.7
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
@@ -353,14 +379,32 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "${{ needs.sign.outputs.image_digest }}"
-          STABLE="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:stable"
+          STABLE="${IMAGE_NAME}:stable"
           docker tag "${{ needs.sign.outputs.image_digest }}" "$STABLE"
           docker push "$STABLE"
     outputs:
       image: ${{ needs.sign.outputs.image_digest }}
 
   # ---------------------------------------------------------------------
-  # 7. Deploy to staging via ArgoCD, then smoke test
+  # 7. Deploy to staging: bump the image tag in the GitOps repo, let
+  #    ArgoCD's own automated sync/self-heal pick it up, then smoke test.
+  #
+  #    eks-platform (the GitOps repo, vars.GITOPS_REPO) runs one EKS
+  #    cluster: all 12 of its microservice Applications are Helm releases
+  #    of the same charts/microservice chart, and that chart's single
+  #    `image.tag` field (charts/microservice/values.yaml) is shared
+  #    fleet-wide — there is no separate environments/staging vs
+  #    environments/production overlay to target (eks-platform's own
+  #    values files under charts/values/ only override per-service
+  #    identity and scaling, never the image). So "staging" here is the
+  #    automated half of the promotion: this job bumps that one field,
+  #    pushes to eks-platform's `main` (the only branch its Applications'
+  #    `targetRevision` watches), and relies on the `syncPolicy.automated`
+  #    (prune + selfHeal) already set on every Application in
+  #    argocd/apps/ to pick the change up on its own. The explicit
+  #    `argocd app sync`/`wait` below turns that into a deterministic gate
+  #    this workflow can block on, instead of guessing how long
+  #    auto-sync's poll interval takes.
   # ---------------------------------------------------------------------
   deploy-staging:
     name: deploy-staging
@@ -375,22 +419,38 @@ jobs:
       - name: Checkout (for smoke-tests/)
         uses: actions/checkout@v7.0.1
 
-      - name: Checkout GitOps repo
+      - name: Checkout GitOps repo (shubh17shah/eks-platform)
         uses: actions/checkout@v7.0.1
         with:
           repository: ${{ vars.GITOPS_REPO }}
           token: ${{ secrets.GITOPS_REPO_TOKEN }}
           path: gitops
 
-      - name: Update staging image tag
+      - name: Record current image tag (for rollback)
+        id: previous
+        working-directory: gitops
+        run: |
+          CURRENT=$(yq '.image.tag' charts/microservice/values.yaml)
+          echo "tag=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "$CURRENT" > previous-tag.txt
+
+      - name: Upload previous tag artifact
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: previous-image-tag
+          path: gitops/previous-tag.txt
+          retention-days: 5
+
+      - name: Bump image.tag in charts/microservice/values.yaml
         working-directory: gitops
         run: |
           set -euo pipefail
-          FILE="environments/staging/kustomization.yaml"
-          yq -i '.images[0].newTag = strenv(IMAGE_TAG)' "$FILE"
+          FILE="charts/microservice/values.yaml"
+          yq -i '.image.tag = strenv(IMAGE_TAG)' "$FILE"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "deploy(staging): devsecops-pipeline app@${IMAGE_TAG}"
+          git commit -am "deploy(staging): telemetry-service@${IMAGE_TAG}"
           git push
 
       - name: Install argocd CLI
@@ -402,20 +462,38 @@ jobs:
         env:
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
-          argocd app sync "${{ vars.ARGOCD_STAGING_APP }}" \
-            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
-          argocd app wait "${{ vars.ARGOCD_STAGING_APP }}" \
-            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
-            --health --timeout 300
+          set -euo pipefail
+          # vars.ARGOCD_APPS: space-separated ArgoCD Application names to
+          # gate on, e.g. "telemetry-ingest telemetry-query" — the two
+          # Applications in argocd/apps/ that are this service under its
+          # own name. The other 10 Applications sharing this image tag
+          # update via the same automated selfHeal independently of this
+          # workflow; these two are what this repo's own smoke tests below
+          # exercise directly.
+          for app in ${{ vars.ARGOCD_APPS }}; do
+            argocd app sync "$app" --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
+            argocd app wait "$app" --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
+              --health --timeout 300
+          done
 
       - name: Smoke test staging
         env:
           SMOKE_TEST_URL: ${{ vars.STAGING_URL }}
-          EXPECTED_VERSION: ${{ env.IMAGE_TAG }}
         run: ./smoke-tests/smoke-test.sh
 
   # ---------------------------------------------------------------------
-  # 8. Deploy to production — gated behind manual approval
+  # 8. Production sign-off — gated behind manual approval
+  #
+  #    There is no second cluster/values file to bump here (see the
+  #    deploy-staging comment above): the image this job confirms is the
+  #    same release deploy-staging already put on the one EKS cluster.
+  #    This job is the human checkpoint on top of it — a required reviewer
+  #    on the `production` GitHub Environment signs off, then this job
+  #    independently re-verifies ArgoCD health and runs a second smoke
+  #    test against vars.PROD_URL before the release is considered
+  #    "in production", consistent with eks-platform's own documented
+  #    single-cluster, cost-constrained design (see that repo's
+  #    charts/microservice/values.yaml comments on its node group size).
   # ---------------------------------------------------------------------
   deploy-prod:
     name: deploy-prod
@@ -429,63 +507,28 @@ jobs:
       - name: Checkout (for smoke-tests/)
         uses: actions/checkout@v7.0.1
 
-      - name: Checkout GitOps repo
-        uses: actions/checkout@v7.0.1
-        with:
-          repository: ${{ vars.GITOPS_REPO }}
-          token: ${{ secrets.GITOPS_REPO_TOKEN }}
-          path: gitops
-
-      - name: Record current production tag (for rollback)
-        id: previous
-        working-directory: gitops
-        run: |
-          CURRENT=$(yq '.images[0].newTag' environments/production/kustomization.yaml)
-          echo "tag=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "$CURRENT" > previous-tag.txt
-
-      - name: Upload previous tag artifact
-        if: always()
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: previous-prod-tag
-          path: gitops/previous-tag.txt
-          retention-days: 5
-
-      - name: Update production image tag
-        working-directory: gitops
-        run: |
-          set -euo pipefail
-          FILE="environments/production/kustomization.yaml"
-          yq -i '.images[0].newTag = strenv(IMAGE_TAG)' "$FILE"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "deploy(production): devsecops-pipeline app@${IMAGE_TAG}"
-          git push
-
       - name: Install argocd CLI
         run: |
           curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
 
-      - name: Sync and wait for ArgoCD health
+      - name: Re-verify ArgoCD health post-approval
         env:
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
-          argocd app sync "${{ vars.ARGOCD_PROD_APP }}" \
-            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
-          argocd app wait "${{ vars.ARGOCD_PROD_APP }}" \
-            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
-            --health --timeout 300
+          set -euo pipefail
+          for app in ${{ vars.ARGOCD_APPS }}; do
+            argocd app wait "$app" --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
+              --health --timeout 300
+          done
 
       - name: Post-deploy health check
         env:
           SMOKE_TEST_URL: ${{ vars.PROD_URL }}
-          EXPECTED_VERSION: ${{ env.IMAGE_TAG }}
         run: ./smoke-tests/smoke-test.sh
 
   # ---------------------------------------------------------------------
-  # 9. Automatic rollback if the production release fails its health gate
+  # 9. Automatic rollback if the production health check fails
   # ---------------------------------------------------------------------
   rollback:
     name: rollback
@@ -496,7 +539,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout GitOps repo
+      - name: Checkout GitOps repo (shubh17shah/eks-platform)
         uses: actions/checkout@v7.0.1
         with:
           repository: ${{ vars.GITOPS_REPO }}
@@ -506,19 +549,19 @@ jobs:
       - name: Download previous tag artifact
         uses: actions/download-artifact@v8.0.1
         with:
-          name: previous-prod-tag
+          name: previous-image-tag
           path: previous
 
-      - name: Revert production image tag
+      - name: Revert image.tag in charts/microservice/values.yaml
         working-directory: gitops
         run: |
           set -euo pipefail
           PREVIOUS_TAG=$(cat ../previous/previous-tag.txt)
-          FILE="environments/production/kustomization.yaml"
-          yq -i ".images[0].newTag = \"${PREVIOUS_TAG}\"" "$FILE"
+          FILE="charts/microservice/values.yaml"
+          yq -i ".image.tag = \"${PREVIOUS_TAG}\"" "$FILE"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "rollback(production): revert to ${PREVIOUS_TAG} after failed health check on ${IMAGE_TAG}"
+          git commit -am "rollback: revert telemetry-service to ${PREVIOUS_TAG} after failed health check on ${IMAGE_TAG}"
           git push
 
       - name: Install argocd CLI
@@ -530,11 +573,12 @@ jobs:
         env:
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
-          argocd app sync "${{ vars.ARGOCD_PROD_APP }}" \
-            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
-          argocd app wait "${{ vars.ARGOCD_PROD_APP }}" \
-            --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
-            --health --timeout 300
+          set -euo pipefail
+          for app in ${{ vars.ARGOCD_APPS }}; do
+            argocd app sync "$app" --server "${{ vars.ARGOCD_SERVER }}" --grpc-web
+            argocd app wait "$app" --server "${{ vars.ARGOCD_SERVER }}" --grpc-web \
+              --health --timeout 300
+          done
 
       - name: Confirm rollback is healthy
         env:

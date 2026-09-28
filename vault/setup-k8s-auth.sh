@@ -31,13 +31,13 @@
 #   ./vault/setup-k8s-auth.sh
 #
 # VAULT_ADDR, KUBERNETES_HOST, K8S_NAMESPACE and K8S_SERVICE_ACCOUNT below
-# are all placeholder-shaped — replace them (via env vars, not by editing
-# this file) with real values for your cluster before running this
-# against a real Vault.
+# all need real values for your cluster — set them via environment
+# variables (not by editing this file) before running this against a
+# real Vault.
 
 set -euo pipefail
 
-# --- configuration (placeholders — override via environment) ---------------
+# --- configuration (override via environment) -------------------------------
 VAULT_ADDR="${VAULT_ADDR:?set VAULT_ADDR, e.g. https://vault.example.internal:8200}"
 KUBERNETES_HOST="${KUBERNETES_HOST:-https://kubernetes.default.svc:443}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-devsecops-pipeline}"

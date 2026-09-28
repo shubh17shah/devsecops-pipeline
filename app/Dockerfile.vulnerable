@@ -2,40 +2,44 @@
 #
 # INTENTIONALLY VULNERABLE — do not use this image anywhere real.
 #
-# This is a deliberate regression of app/Dockerfile: same builder stage,
-# same application, but the final stage sits on an End-of-Life base image
-# with years of unpatched OS package CVEs, and drops the non-root USER.
-# It exists purely to prove that the Trivy gate in .github/workflows/ci.yml
-# actually blocks a build — see docs/PROOF.md and
-# .github/workflows/vulnerable-demo.yml.
+# This file exists for exactly one reason: to give
+# .github/workflows/verify-security-gates.yml something that the Trivy
+# gate in .github/workflows/ci.yml is guaranteed to block, so that gate's
+# behavior is checked on a schedule instead of trusted on faith. It is not
+# an alternate build target, it is not used by `docker build` in ci.yml,
+# and it is never pushed to a registry.
+#
+# The regression from app/Dockerfile is narrow and deliberate: same
+# application code, same npm install, but the runtime stage sits on
+# `node:16-alpine` instead of `node:20-alpine`. Node.js 16 reached
+# End-of-Life in September 2023 — no further security patches are
+# published for it or the Alpine package set pinned alongside it, so
+# Trivy's vulnerability database has an accumulating, permanent supply of
+# HIGH/CRITICAL CVEs against it (openssl, libcrypto, zlib, plus whatever
+# npm-installed native addons link against them). That is what makes it
+# useful as a control-verification fixture: it doesn't stop being
+# vulnerable, so the gate has something durable to keep catching.
+#
+# See docs/SECURITY-GATES.md for what this proves and how the workflow
+# reads.
 
-# ---- build stage (unchanged from app/Dockerfile) ---------------------------
-FROM golang:1.23-alpine AS builder
+# ---- deps stage (unchanged from app/Dockerfile) ---------------------------
+FROM node:16-alpine AS deps
+WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev && npm cache clean --force
 
-WORKDIR /src
+# ---- runtime stage: deliberately EOL, deliberately root -------------------
+# node:16-alpine ("Node 16") is EOL — nothing in its package set has been
+# patched since. No USER instruction either: this runs as root, on purpose,
+# so it also flags on a misconfiguration check, not just CVE count.
+FROM node:16-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
 
-COPY go.mod ./
-RUN go mod download
-
-COPY . .
-
-ARG VERSION=dev
-ENV CGO_ENABLED=0 \
-    GOOS=linux \
-    GOARCH=amd64
-
-RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/app .
-
-# ---- final stage: deliberately ancient, deliberately root ------------------
-# ubuntu:16.04 ("Xenial") went End-of-Standard-Support in April 2021.
-# Nobody has shipped a security patch for its package set since. Trivy's
-# vulnerability DB has years of accumulated HIGH/CRITICAL CVEs for it.
-FROM ubuntu:16.04 AS final
-
-COPY --from=builder /out/app /app
-
-# No USER instruction: runs as root, on purpose, to make this as bad an
-# example as the demo needs it to be.
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY src ./src
 
 EXPOSE 8080
-ENTRYPOINT ["/app"]
+CMD ["node", "src/server.js"]

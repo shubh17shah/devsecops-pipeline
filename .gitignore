@@ -25,12 +25,11 @@ crash.log
 .DS_Store
 *.log
 node_modules/
+npm-debug.log*
+coverage/
 __pycache__/
 venv/
 
 # local tool downloads / build cache
 .tmp-toolchain/
-gocache/
 *.tar.gz
-app-bin
-app-run

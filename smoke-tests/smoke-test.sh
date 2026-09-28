@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# smoke-test.sh — post-deploy smoke tests for the devsecops-pipeline app.
+# smoke-test.sh — post-deploy smoke tests for telemetry-service.
 #
 # Run by the `deploy-staging` job right after ArgoCD reports the
 # application Synced/Healthy, and again against production after the
@@ -12,15 +12,16 @@
 #   smoke-test.sh [base_url]
 #
 # Environment variables:
-#   SMOKE_TEST_URL      Base URL of the deployed service.
-#                        Defaults to http://localhost:8080, or to the
-#                        positional argument if one is given.
-#   EXPECTED_VERSION     If set, /version must report exactly this value.
-#                        The CI pipeline passes the git SHA it just deployed
-#                        so a smoke test can catch "ArgoCD synced the wrong
-#                        image tag" as well as "the pod won't start".
-#   MAX_RETRIES          Number of attempts per endpoint (default: 10).
-#   RETRY_DELAY_SECONDS  Delay between attempts (default: 3).
+#   SMOKE_TEST_URL       Base URL of the deployed service.
+#                          Defaults to http://localhost:8080, or to the
+#                          positional argument if one is given.
+#   EXPECTED_SERVICE      If set, GET / must report exactly this
+#                          "service" value (src/config.js SERVICE_NAME).
+#                          Useful when this script is pointed at a
+#                          specific Application (e.g. telemetry-ingest)
+#                          rather than the generic image default.
+#   MAX_RETRIES            Number of attempts per endpoint (default: 10).
+#   RETRY_DELAY_SECONDS    Delay between attempts (default: 3).
 #
 # Requires: curl. Uses grep/sed for JSON field extraction so it has no
 # dependency on jq being present on the runner or in the container image.
@@ -29,7 +30,7 @@ set -uo pipefail
 
 BASE_URL="${1:-${SMOKE_TEST_URL:-http://localhost:8080}}"
 BASE_URL="${BASE_URL%/}"
-EXPECTED_VERSION="${EXPECTED_VERSION:-}"
+EXPECTED_SERVICE="${EXPECTED_SERVICE:-}"
 MAX_RETRIES="${MAX_RETRIES:-10}"
 RETRY_DELAY_SECONDS="${RETRY_DELAY_SECONDS:-3}"
 
@@ -92,22 +93,29 @@ if ! wait_for_endpoint "/readyz"; then
     : # already recorded as a failure by wait_for_endpoint
 fi
 
-log "checking /version"
-version_body=$(curl -s --max-time 5 "${BASE_URL}/version" || true)
-version_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${BASE_URL}/version" 2>/dev/null)
-[ -z "$version_status" ] && version_status="000"
-if [ "$version_status" != "200" ]; then
-    fail "/version returned HTTP $version_status"
+log "checking / (service identity)"
+index_body=$(curl -s --max-time 5 "${BASE_URL}/" || true)
+index_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${BASE_URL}/" 2>/dev/null)
+[ -z "$index_status" ] && index_status="000"
+if [ "$index_status" != "200" ]; then
+    fail "/ returned HTTP $index_status"
 else
-    got_version=$(json_field "$version_body" version)
-    if [ -z "$got_version" ]; then
-        fail "/version response had no parsable version field: $version_body"
+    got_service=$(json_field "$index_body" service)
+    if [ -z "$got_service" ]; then
+        fail "/ response had no parsable service field: $index_body"
     else
-        log "/version reports: $got_version"
-        if [ -n "$EXPECTED_VERSION" ] && [ "$got_version" != "$EXPECTED_VERSION" ]; then
-            fail "deployed version '$got_version' does not match expected '$EXPECTED_VERSION'"
+        log "/ reports service: $got_service"
+        if [ -n "$EXPECTED_SERVICE" ] && [ "$got_service" != "$EXPECTED_SERVICE" ]; then
+            fail "deployed service '$got_service' does not match expected '$EXPECTED_SERVICE'"
         fi
     fi
+fi
+
+log "checking /metrics (Prometheus exposition)"
+metrics_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${BASE_URL}/metrics" 2>/dev/null)
+[ -z "$metrics_status" ] && metrics_status="000"
+if [ "$metrics_status" != "200" ]; then
+    fail "/metrics returned HTTP $metrics_status"
 fi
 
 if [ "$failures" -eq 0 ]; then
