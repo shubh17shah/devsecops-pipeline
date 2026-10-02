@@ -106,7 +106,7 @@ jobs:
 
       - name: SonarCloud scan
         id: sonarcloud
-        uses: SonarSource/sonarqube-scan-action@v8.2.2
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
         # SONAR_TOKEN isn't available on PRs from forks, and a SonarCloud
         # org may not be wired up for every fork of this repo — don't let
         # a missing/invalid token take the whole pipeline down. Semgrep
