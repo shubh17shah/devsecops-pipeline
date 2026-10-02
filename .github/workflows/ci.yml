@@ -77,11 +77,9 @@ jobs:
 
       - name: Install dependencies
         # No package-lock.json is committed yet (see app/README.md "Local
-        # development"), so `npm ci` has nothing to install *against*.
-        # `npm install` resolves and installs in one step here; once the
-        # lockfile is committed, swap this for `npm ci` so CI installs
-        # exactly what's locked instead of re-resolving every run.
-        run: npm install
+        # `npm ci` installs strictly from the committed lockfile and fails
+        # if it has drifted from package.json — reproducible by construction.
+        run: npm ci
 
       - name: Lint
         run: npm run lint

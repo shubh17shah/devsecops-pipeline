@@ -2,18 +2,11 @@
 
 # ---- deps stage ---------------------------------------------------------
 # package-lock.json isn't committed (this image was authored without
-# running `npm install` — see the note in README.md "Local development").
-# `npm install` here resolves the dependency graph and writes the lockfile
-# inside this throwaway stage, mirroring how apps/*-service Go images (if
-# any) run `go mod tidy` at build time rather than committing go.sum.
-# `npm ci` is what actually runs against a *committed* lockfile in a real
-# pipeline — once package-lock.json exists in this directory, swap the
-# `npm install` line below for `npm ci --omit=dev` and delete this stage's
-# lockfile-generation step.
-FROM node:20-alpine AS deps
-WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev && npm cache clean --force
+# `npm ci` installs exactly what package-lock.json pins — no version
+# drift between this build and any other. It also fails loudly if the
+# lockfile and package.json disagree, which is the behaviour you want
+# in a build: a surprising dependency should break CI, not production.
+RUN npm ci --omit=dev && npm cache clean --force
 
 # ---- runtime stage -------------------------------------------------------
 # Same base as the deps stage (not a from-scratch/distroless image):

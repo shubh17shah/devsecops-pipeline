@@ -1,0 +1,9 @@
+# Code owners for devsecops-pipeline.
+#
+# A single maintainer owns this repository end-to-end today (the app, its
+# tests, the Dockerfile, and the CI/CD pipeline that scans/signs/ships
+# it), so one catch-all rule routes every pull request for review rather
+# than splitting ownership across paths that don't yet have independent
+# reviewers. Split this file by path (e.g. a dedicated owner for
+# .github/workflows/ or app/) if/when that changes.
+*       @shubh17shah

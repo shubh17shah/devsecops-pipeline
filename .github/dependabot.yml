@@ -1,0 +1,35 @@
+version: 2
+
+updates:
+  # app/package.json — Express, pino, amqplib, ioredis, pg, prom-client, etc.
+  - package-ecosystem: npm
+    directory: /app
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    labels:
+      - dependencies
+
+  # app/Dockerfile — node:20-alpine base image used by both the runtime
+  # image and the deliberately vulnerable fixture's build context.
+  - package-ecosystem: docker
+    directory: /app
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(docker)
+    labels:
+      - dependencies
+
+  # .github/workflows/*.yml — actions/checkout, docker/build-push-action,
+  # aquasecurity/trivy-action, sigstore/cosign-installer, etc.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(ci)
+    labels:
+      - dependencies
+      - ci

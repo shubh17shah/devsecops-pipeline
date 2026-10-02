@@ -1,5 +1,9 @@
 # devsecops-pipeline
 
+[![ci](https://github.com/shubh17shah/devsecops-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/shubh17shah/devsecops-pipeline/actions/workflows/ci.yml)
+[![verify-security-gates](https://github.com/shubh17shah/devsecops-pipeline/actions/workflows/verify-security-gates.yml/badge.svg)](https://github.com/shubh17shah/devsecops-pipeline/actions/workflows/verify-security-gates.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 The application-delivery repo for **telemetry-service**: source, tests,
 and a CI/CD pipeline where every security gate is a real, enforced block —
 not a report nobody reads. This repo builds, tests, scans, signs, and
