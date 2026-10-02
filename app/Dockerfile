@@ -13,7 +13,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Node.js needs its runtime present regardless, and node:20-alpine already
 # gives us a non-root `node` user (uid 1000) and a package manager for the
 # one runtime tool we add below, at ~180MB rather than a full Debian base.
-FROM node:20-alpine AS runtime
+FROM node:26-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 

@@ -24,7 +24,7 @@
 # reads.
 
 # ---- deps stage (unchanged from app/Dockerfile) ---------------------------
-FROM node:16-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
@@ -33,7 +33,7 @@ RUN npm install --omit=dev && npm cache clean --force
 # node:16-alpine ("Node 16") is EOL — nothing in its package set has been
 # patched since. No USER instruction either: this runs as root, on purpose,
 # so it also flags on a misconfiguration check, not just CVE count.
-FROM node:16-alpine AS runtime
+FROM node:26-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
