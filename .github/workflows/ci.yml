@@ -321,7 +321,7 @@ jobs:
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Generate SBOM (Syft)
-        uses: anchore/sbom-action@v0.24.2
+        uses: anchore/sbom-action@v0.24.3
         with:
           image: ${{ steps.push-image.outputs.digest }}
           format: spdx-json
